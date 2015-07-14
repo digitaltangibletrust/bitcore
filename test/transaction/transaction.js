@@ -8,6 +8,7 @@ var _ = require('lodash');
 var sinon = require('sinon');
 
 var bitcore = require('../..');
+var BN = bitcore.crypto.BN;
 var Transaction = bitcore.Transaction;
 var PrivateKey = bitcore.PrivateKey;
 var Script = bitcore.Script;
@@ -31,6 +32,7 @@ describe('Transaction', function() {
   });
 
   var testScript = 'OP_DUP OP_HASH160 20 0x88d9931ea73d60eaf7e5671efc0552b912911f2a OP_EQUALVERIFY OP_CHECKSIG';
+  var testScriptHex = '76a91488d9931ea73d60eaf7e5671efc0552b912911f2a88ac';
   var testPrevTx = 'a477af6b2667c29670467e4e0728b685ee07b240235771862318e29ddbe58458';
   var testAmount = 1020000;
   var testTransaction = new Transaction()
@@ -44,15 +46,16 @@ describe('Transaction', function() {
   it('can serialize to a plain javascript object', function() {
     var object = testTransaction.toObject();
     object.inputs[0].output.satoshis.should.equal(testAmount);
-    object.inputs[0].output.script.toString().should.equal(testScript);
+    object.inputs[0].output.script.should.equal(testScriptHex);
     object.inputs[0].prevTxId.should.equal(testPrevTx);
     object.inputs[0].outputIndex.should.equal(0);
     object.outputs[0].satoshis.should.equal(testAmount - 10000);
   });
 
-  it('can take a string argument as an amount', function() {
-    var stringTx = new Transaction().to('mrU9pEmAx26HcbKVrABvgL7AwA5fjNFoDc', '10000');
-    (stringTx.outputAmount).should.equal(10000);
+  it('will not accept NaN as an amount', function() {
+    (function() {
+      var stringTx = new Transaction().to('mrU9pEmAx26HcbKVrABvgL7AwA5fjNFoDc', NaN);
+    }).should.throw('Amount is expected to be a positive integer');
   });
 
   it('returns the fee correctly', function() {
@@ -140,6 +143,9 @@ describe('Transaction', function() {
     script: Script.buildPublicKeyHashOut(fromAddress).toString(),
     satoshis: 1e8
   };
+  var tenth = 1e7;
+  var fourth = 25e6;
+  var half = 5e7;
 
   describe('adding inputs', function() {
 
@@ -159,14 +165,12 @@ describe('Transaction', function() {
           .sign(privateKey);
         transaction.isFullySigned().should.equal(true);
       });
-
       it('fails when Inputs are not subclassed and isFullySigned is called', function() {
         var tx = new Transaction(tx_1_hex);
         expect(function() {
           return tx.isFullySigned();
         }).to.throw(errors.Transaction.UnableToVerifySignature);
       });
-
       it('fails when Inputs are not subclassed and verifySignature is called', function() {
         var tx = new Transaction(tx_1_hex);
         expect(function() {
@@ -174,6 +178,15 @@ describe('Transaction', function() {
             inputIndex: 0
           });
         }).to.throw(errors.Transaction.UnableToVerifySignature);
+      });
+      it('passes result of input.isValidSignature', function() {
+        var tx = new Transaction(tx_1_hex);
+        tx.from(simpleUtxoWith1BTC);
+        tx.inputs[0].isValidSignature = sinon.stub().returns(true);
+        var sig = {
+          inputIndex: 0
+        };
+        tx.isValidSignature(sig).should.equal(true);
       });
     });
   });
@@ -189,7 +202,9 @@ describe('Transaction', function() {
       transaction.outputs[1].satoshis.should.equal(40000);
       transaction.outputs[1].script.toString()
         .should.equal(Script.fromAddress(changeAddress).toString());
-      transaction.getChangeOutput().script.should.deep.equal(Script.fromAddress(changeAddress));
+      var actual = transaction.getChangeOutput().script.toString();
+      var expected = Script.fromAddress(changeAddress).toString();
+      actual.should.equal(expected);
     });
     it('accepts a P2SH address for change', function() {
       var transaction = new Transaction()
@@ -244,6 +259,34 @@ describe('Transaction', function() {
       transaction.outputs.length.should.equal(2);
       transaction.outputs[1].satoshis.should.equal(10000);
     });
+    it('fee per kb can be set up manually', function() {
+      var inputs = _.map(_.range(10), function(i) {
+        var utxo = _.clone(simpleUtxoWith100000Satoshis);
+        utxo.outputIndex = i;
+        return utxo;
+      });
+      var transaction = new Transaction()
+        .from(inputs)
+        .to(toAddress, 950000)
+        .feePerKb(8000)
+        .change(changeAddress)
+        .sign(privateKey);
+      transaction._estimateSize().should.be.within(1000, 1999);
+      transaction.outputs.length.should.equal(2);
+      transaction.outputs[1].satoshis.should.equal(34000);
+    });
+    it('if satoshis are invalid', function() {
+      var transaction = new Transaction()
+        .from(simpleUtxoWith100000Satoshis)
+        .to(toAddress, 99999)
+        .change(changeAddress)
+        .sign(privateKey);
+      transaction.outputs[0]._satoshis = 100;
+      transaction.outputs[0]._satoshisBN = new BN(101, 10);
+      expect(function() {
+        return transaction.serialize();
+      }).to.throw(errors.Transaction.InvalidSatoshis);
+    });
     it('if fee is too small, fail serialization', function() {
       var transaction = new Transaction()
         .from(simpleUtxoWith100000Satoshis)
@@ -252,7 +295,7 @@ describe('Transaction', function() {
         .sign(privateKey);
       expect(function() {
         return transaction.serialize();
-      }).to.throw(errors.Transaction.FeeError);
+      }).to.throw(errors.Transaction.FeeError.TooSmall);
     });
     it('on second call to sign, change is not recalculated', function() {
       var transaction = new Transaction()
@@ -318,7 +361,7 @@ describe('Transaction', function() {
         .to(toAddress, 40000000);
       expect(function() {
         return transaction.serialize();
-      }).to.throw(errors.Transaction.FeeError);
+      }).to.throw(errors.Transaction.FeeError.TooLarge);
     });
     it('fails if a dust output is created', function() {
       var transaction = new Transaction()
@@ -350,11 +393,47 @@ describe('Transaction', function() {
         return transaction.serialize();
       }).to.not.throw(errors.Transaction.DustOutputs);
     });
+    it('fails when outputs and fee don\'t add to total input', function() {
+      var transaction = new Transaction()
+        .from(simpleUtxoWith1BTC)
+        .to(toAddress, 99900000)
+        .fee(99999)
+        .sign(privateKey);
+      expect(function() {
+        return transaction.serialize();
+      }).to.throw(errors.Transaction.FeeError.Different);
+    });
+    it('checks output amount before fee errors', function() {
+      var transaction = new Transaction();
+      transaction.from(simpleUtxoWith1BTC);
+      transaction
+        .to(toAddress, 10000000000000)
+        .change(changeAddress)
+        .fee(5);
+
+      expect(function() {
+        return transaction.serialize();
+      }).to.throw(errors.Transaction.InvalidOutputAmountSum);
+    });
+    it('will throw fee error with disableMoreOutputThanInput enabled (but not triggered)', function() {
+      var transaction = new Transaction();
+      transaction.from(simpleUtxoWith1BTC);
+      transaction
+        .to(toAddress, 90000000)
+        .change(changeAddress)
+        .fee(10000000);
+
+      expect(function() {
+        return transaction.serialize({
+          disableMoreOutputThanInput: true
+        });
+      }).to.throw(errors.Transaction.FeeError.TooLarge);
+    });
     describe('skipping checks', function() {
-      var buildSkipTest = function(builder, check) {
+      var buildSkipTest = function(builder, check, expectedError) {
         return function() {
           var transaction = new Transaction();
-          transaction.from(simpleUtxoWith1BTC)
+          transaction.from(simpleUtxoWith1BTC);
           builder(transaction);
 
           var options = {};
@@ -365,48 +444,119 @@ describe('Transaction', function() {
           }).not.to.throw();
           expect(function() {
             return transaction.serialize();
-          }).to.throw();
+          }).to.throw(expectedError);
         };
       };
-      it('can skip the check for too much fee', function() {
-        buildSkipTest(function(transaction) {
+      it('can skip the check for too much fee', buildSkipTest(
+        function(transaction) {
           return transaction
             .fee(50000000)
             .change(changeAddress)
             .sign(privateKey);
-        }, 'disableLargeFees');
-      });
-      it('can skip the check for a fee that is too small', function() {
-        buildSkipTest(function(transaction) {
+        }, 'disableLargeFees', errors.Transaction.FeeError.TooLarge
+      ));
+      it('can skip the check for a fee that is too small', buildSkipTest(
+        function(transaction) {
           return transaction
             .fee(1)
             .change(changeAddress)
             .sign(privateKey);
-        }, 'disableSmallFees');
-      });
-      it('can skip the check that prevents dust outputs', function() {
-        buildSkipTest(function(transaction) {
+        }, 'disableSmallFees', errors.Transaction.FeeError.TooSmall
+      ));
+      it('can skip the check that prevents dust outputs', buildSkipTest(
+        function(transaction) {
           return transaction
-            .to(toAddress, 1000)
+            .to(toAddress, 100)
             .change(changeAddress)
             .sign(privateKey);
-        }, 'disableDustOutputs');
-      });
-      it('can skip the check that prevents unsigned outputs', function() {
-        buildSkipTest(function(transaction) {
+        }, 'disableDustOutputs', errors.Transaction.DustOutputs
+      ));
+      it('can skip the check that prevents unsigned outputs', buildSkipTest(
+        function(transaction) {
           return transaction
             .to(toAddress, 10000)
             .change(changeAddress);
-        }, 'disableIsFullySigned');
-      });
-      it('can skip the check that avoids spending more bitcoins than the inputs for a transaction', function() {
-        buildSkipTest(function(transaction) {
+        }, 'disableIsFullySigned', errors.Transaction.MissingSignatures
+      ));
+      it('can skip the check that avoids spending more bitcoins than the inputs for a transaction', buildSkipTest(
+        function(transaction) {
           return transaction
-            .to(toAddress, 10000000000)
-            .change(changeAddress);
-        }, 'disableMoreOutputThanInput');
-      });
+            .to(toAddress, 10000000000000)
+            .change(changeAddress)
+            .sign(privateKey);
+        }, 'disableMoreOutputThanInput', errors.Transaction.InvalidOutputAmountSum
+      ));
     });
+  });
+
+  describe('#verify', function() {
+
+    it('not if _satoshis and _satoshisBN have different values', function() {
+      var tx = new Transaction()
+        .from({
+          'txId': testPrevTx,
+          'outputIndex': 0,
+          'script': testScript,
+          'satoshis': testAmount
+        }).to('mrU9pEmAx26HcbKVrABvgL7AwA5fjNFoDc', testAmount - 10000);
+
+      tx.outputs[0]._satoshis = 100;
+      tx.outputs[0]._satoshisBN = new BN('fffffffffffffff', 16);
+      var verify = tx.verify();
+      verify.should.equal('transaction txout 0 satoshis is invalid');
+    });
+
+    it('not if _satoshis is negative', function() {
+      var tx = new Transaction()
+        .from({
+          'txId': testPrevTx,
+          'outputIndex': 0,
+          'script': testScript,
+          'satoshis': testAmount
+        }).to('mrU9pEmAx26HcbKVrABvgL7AwA5fjNFoDc', testAmount - 10000);
+
+      tx.outputs[0]._satoshis = -100;
+      tx.outputs[0]._satoshisBN = new BN(-100, 10);
+      var verify = tx.verify();
+      verify.should.equal('transaction txout 0 satoshis is invalid');
+    });
+
+    it('not if transaction is greater than max block size', function() {
+
+      var tx = new Transaction()
+        .from({
+          'txId': testPrevTx,
+          'outputIndex': 0,
+          'script': testScript,
+          'satoshis': testAmount
+        }).to('mrU9pEmAx26HcbKVrABvgL7AwA5fjNFoDc', testAmount - 10000);
+
+      tx.toBuffer = sinon.stub().returns({
+        length: 10000000
+      });
+
+      var verify = tx.verify();
+      verify.should.equal('transaction over the maximum block size');
+
+    });
+
+    it('not if has null input (and not coinbase)', function() {
+
+      var tx = new Transaction()
+        .from({
+          'txId': testPrevTx,
+          'outputIndex': 0,
+          'script': testScript,
+          'satoshis': testAmount
+        }).to('mrU9pEmAx26HcbKVrABvgL7AwA5fjNFoDc', testAmount - 10000);
+
+      tx.isCoinbase = sinon.stub().returns(false);
+      tx.inputs[0].isNull = sinon.stub().returns(true);
+      var verify = tx.verify();
+      verify.should.equal('transaction input 0 has null input');
+
+    });
+
   });
 
   describe('to and from JSON', function() {
@@ -491,6 +641,19 @@ describe('Transaction', function() {
         }, [], 1);
       }).to.throw('Number of required signatures must be greater than the number of public keys');
     });
+    it('will add an empty script if not supplied', function() {
+      transaction = new Transaction();
+      var outputScriptString = 'OP_2 21 0x038282263212c609d9ea2a6e3e172de238d8c39' +
+        'cabd5ac1ca10646e23fd5f51508 21 0x038282263212c609d9ea2a6e3e172de23' +
+        '8d8c39cabd5ac1ca10646e23fd5f51508 OP_2 OP_CHECKMULTISIG OP_EQUAL';
+      transaction.addInput(new Transaction.Input({
+        prevTxId: '0000000000000000000000000000000000000000000000000000000000000000',
+        outputIndex: 0,
+        script: new Script()
+      }), outputScriptString, 10000);
+      transaction.inputs[0].output.script.should.be.instanceof(bitcore.Script);
+      transaction.inputs[0].output.script.toString().should.equal(outputScriptString);
+    });
   });
 
   describe('removeInput and removeOutput', function() {
@@ -498,17 +661,19 @@ describe('Transaction', function() {
       var transaction = new Transaction()
         .from(simpleUtxoWith1BTC);
       transaction.inputs.length.should.equal(1);
+      transaction.inputAmount.should.equal(simpleUtxoWith1BTC.satoshis);
       transaction.removeInput(0);
-      transaction.inputAmount.should.equal(0);
       transaction.inputs.length.should.equal(0);
+      transaction.inputAmount.should.equal(0);
     });
     it('can remove an input by transaction id', function() {
       var transaction = new Transaction()
         .from(simpleUtxoWith1BTC);
       transaction.inputs.length.should.equal(1);
+      transaction.inputAmount.should.equal(simpleUtxoWith1BTC.satoshis);
       transaction.removeInput(simpleUtxoWith1BTC.txId, simpleUtxoWith1BTC.outputIndex);
-      transaction.inputAmount.should.equal(0);
       transaction.inputs.length.should.equal(0);
+      transaction.inputAmount.should.equal(0);
     });
     it('fails if the index provided is invalid', function() {
       var transaction = new Transaction()
@@ -522,8 +687,10 @@ describe('Transaction', function() {
         .to(toAddress, 40000000)
         .to(toAddress, 40000000);
       transaction.outputs.length.should.equal(2);
+      transaction.outputAmount.should.equal(80000000);
       transaction.removeOutput(0);
       transaction.outputs.length.should.equal(1);
+      transaction.outputAmount.should.equal(40000000);
     });
   });
 
@@ -611,7 +778,7 @@ describe('Transaction', function() {
       transaction.outputAmount.should.equal(99990000);
     });
     it('returns correct values for coinjoin transaction', function() {
-      // see livenet tx c16467eea05f1f30d50ed6dbc06a38539d9bb15110e4b7dc6653046a3678a718 
+      // see livenet tx c16467eea05f1f30d50ed6dbc06a38539d9bb15110e4b7dc6653046a3678a718
       var transaction = new Transaction(txCoinJoinHex);
       transaction.outputAmount.should.equal(4191290961);
       expect(function() {
@@ -622,9 +789,6 @@ describe('Transaction', function() {
 
   describe('output ordering', function() {
 
-    var tenth = 1e7;
-    var fourth = 25e6;
-    var half = 5e7;
     var transaction, out1, out2, out3, out4;
 
     beforeEach(function() {
@@ -668,11 +832,39 @@ describe('Transaction', function() {
 
     it('fails if the provided function does not work as expected', function() {
       var sorting = function(array) {
-        return [];
+        return [array[0], array[1], array[2]];
       };
       expect(function() {
         transaction.sortOutputs(sorting);
       }).to.throw(errors.Transaction.InvalidSorting);
+    });
+
+    it('shuffle without change', function() {
+      var tx = new Transaction(transaction.toObject()).to(toAddress, half);
+      expect(tx.getChangeOutput()).to.be.null;
+      expect(function() {
+        tx.shuffleOutputs();
+      }).to.not.throw(errors.Transaction.InvalidSorting);
+    })
+  });
+
+  describe('clearOutputs', function() {
+
+    it('removes all outputs and maintains the transaction in order', function() {
+      var tx = new Transaction()
+        .from(simpleUtxoWith1BTC)
+        .to(toAddress, tenth)
+        .to(toAddress, fourth)
+        .to(toAddress, half)
+        .change(changeAddress);
+      tx.clearOutputs();
+      tx.outputs.length.should.equal(1);
+      tx.to(toAddress, tenth);
+      tx.outputs.length.should.equal(2);
+      tx.outputs[0].satoshis.should.equal(10000000);
+      tx.outputs[0].script.toAddress().toString().should.equal(toAddress);
+      tx.outputs[1].satoshis.should.equal(89990000);
+      tx.outputs[1].script.toAddress().toString().should.equal(changeAddress);
     });
 
   });

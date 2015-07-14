@@ -182,6 +182,9 @@ describe('Interpreter', function() {
     if (flagstr.indexOf('DISCOURAGE_UPGRADABLE_NOPS') !== -1) {
       flags = flags | Interpreter.SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS;
     }
+    if (flagstr.indexOf('CHECKLOCKTIMEVERIFY') !== -1) {
+      flags = flags | Interpreter.SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+    }
     return flags;
   };
 
@@ -195,9 +198,6 @@ describe('Interpreter', function() {
     var scriptSig = Script.fromBitcoindString(vector[0]);
     var scriptPubkey = Script.fromBitcoindString(vector[1]);
     var flags = getFlags(vector[2]);
-
-    //testToFromString(scriptSig);
-    //testToFromString(scriptPubkey);
 
     var hashbuf = new Buffer(32);
     hashbuf.fill(0);
@@ -242,7 +242,8 @@ describe('Interpreter', function() {
         var fullScriptString = vector[0] + ' ' + vector[1];
         var comment = descstr ? (' (' + descstr + ')') : '';
         it('should pass script_' + (expected ? '' : 'in') + 'valid ' +
-          'vector #' + c + ': ' + fullScriptString + comment, function() {
+          'vector #' + c + ': ' + fullScriptString + comment,
+          function() {
             testFixture(vector, expected);
           });
       });
@@ -279,12 +280,15 @@ describe('Interpreter', function() {
           var tx = new Transaction(txhex);
           var allInputsVerified = true;
           tx.inputs.forEach(function(txin, j) {
+            if (txin.isNull()) {
+              return;
+            }
             var scriptSig = txin.script;
             var txidhex = txin.prevTxId.toString('hex');
             var txoutnum = txin.outputIndex;
             var scriptPubkey = map[txidhex + ':' + txoutnum];
             should.exist(scriptPubkey);
-            should.exist(scriptSig);
+            (scriptSig !== undefined).should.equal(true);
             var interp = new Interpreter();
             var verified = interp.verify(scriptSig, scriptPubkey, tx, j, flags);
             if (!verified) {
